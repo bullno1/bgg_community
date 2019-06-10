@@ -1,0 +1,207 @@
+#!/usr/bin/env python
+
+from collections import namedtuple
+from pprint import pprint
+import firebase_admin
+import simplejson as json
+import os
+import pathlib
+import xml.etree.ElementTree as ET
+import fire
+import sys
+import schedule
+import fire
+import requests
+
+
+BGG_URL = "https://www.boardgamegeek.com/xmlapi2/{}"
+DATA_DIR = os.getenv("BGG_TOOL_DATA_DIR", "./data")
+GSHEET_ID = os.getenv("BGG_TOOL_GSHEET_ID", "1bZn6d_cY7uk9pwPvJXWc-6etKuZbcQHFmzAwh1EzYbY")
+FIREBASE_PROJECT_ID = os.getenv("BGG_TOOL_FIREBASE_PROJECT_ID", "hebg-e2b7c")
+
+
+Game = namedtuple('Game', [
+    'id',
+    'name',
+    'image',
+    'thumbnail',
+    'numplays',
+    'status',
+])
+
+GameStatus = namedtuple('GameStatus', [
+    'fortrade',
+    'own',
+    'preordered',
+    'prevowned',
+    'want',
+    'wanttobuy',
+    'wanttoplay',
+    'wishlist',
+    'wishlistpriority',
+])
+
+
+def main(args):
+    return fire.Fire(Command)
+
+
+class Command:
+    "BGG tool"
+
+    @staticmethod
+    def fetch_collection(username):
+        collection = _bgg_request('collection', username=username, excludesubtype='boardgameexpansion')
+
+        if collection is not None:
+            _save_data(f"{username}.xml", ET.tostring(collection, encoding="utf-8"))
+            return collection
+
+    @staticmethod
+    def parse_collection(username):
+        xml = ET.parse(os.path.join(DATA_DIR, username) + ".xml")
+
+        collection = {}
+
+        for item in xml.findall('./item'):
+            status_el = item.find('status')
+            status = GameStatus(
+                fortrade=status_el.get('fortrade') == '1',
+                own=status_el.get('own') == '1',
+                preordered=status_el.get('preordered') == '1',
+                prevowned=status_el.get('prevowned') == '1',
+                want=status_el.get('want') == '1',
+                wanttobuy=status_el.get('wanttobuy') == '1',
+                wanttoplay=status_el.get('wanttoplay') == '1',
+                wishlist=status_el.get('wishlist') == '1',
+                wishlistpriority=status_el.get('wishlistpriority') == '1',
+            )
+            game = Game(
+                name=item.find('name').text,
+                id=item.get('objectid'),
+                image=item.find('image').text,
+                thumbnail=item.find('thumbnail').text,
+                numplays=int(item.find('numplays').text),
+                status=status,
+            )
+            collection[game.id] = game
+
+        return collection
+
+    @staticmethod
+    def analyze(*users):
+        collections = {}
+
+        for user in users:
+            collection = Command.parse_collection(user)
+            collections[users] = collection
+
+        analyzers_cls = [
+            _MasterList
+        ]
+        analyzers = [cls() for cls in analyzers_cls]
+
+        for username, collection in collections.items():
+            for analyzer in analyzers:
+                analyzer.process(username, collection)
+
+        results = {}
+        for analyzer in analyzers:
+            results[analyzer.name] = analyzer.result
+
+        _save_data("analysis.json", json.dumps(results).encode("utf-8"))
+
+        return results
+
+    @staticmethod
+    def fetch_members():
+        from googleapiclient.discovery import build
+
+        service = build('sheets', 'v4')
+        sheet = service.spreadsheets()
+        result = sheet.values().get(spreadsheetId=GSHEET_ID, range='Members').execute()
+        values = result.get('values', [])
+        header = values[0]
+        records = [dict(zip(header, row)) for row in values[1:]]
+        _save_data("member.json", json.dumps(records).encode("utf-8"))
+
+        return records
+
+    @staticmethod
+    def upload():
+        import firebase_admin
+        from firebase_admin import credentials
+        from firebase_admin import storage
+
+        cred = credentials.Certificate(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+        firebase_admin.initialize_app(cred, {
+            'storageBucket': f'{FIREBASE_PROJECT_ID}.appspot.com'
+            })
+
+        bucket = storage.bucket()
+
+        bucket.blob("members.json").upload_from_filename(os.path.join(DATA_DIR, "member.json"))
+        bucket.blob("analysis.json").upload_from_filename(os.path.join(DATA_DIR, "analysis.json"))
+
+    @staticmethod
+    def service():
+        member_records = Command.fetch_members()
+        usernames = [member_record['bgg_username'] for member_record in member_records]
+        for username in usernames:
+            Command.fetch_collection(username)
+
+        Command.analyze(*usernames)
+        Command.upload()
+
+
+class _MasterList:
+    name = "master_list"
+
+    def __init__(self):
+        self.master_list = {}
+
+    def process(self, username, collection):
+        for game_id, game in collection.items():
+            if game.status.own:
+                self.master_list[game_id] = game._replace(
+                    status=None,
+                    numplays=None,
+                )
+
+    @property
+    def result(self):
+        return self.master_list
+
+
+class _MostWanted:
+    name = "most_wanted"
+
+    def __init__(self):
+        self.master_list = {}
+
+    def process(self, username, collection):
+        for game_id, game in collection.items():
+            self.master_list[game_id] = game._replace(
+                status=None,
+                numplays=None,
+            )
+
+    @property
+    def result(self):
+        return self.master_list
+
+
+def _bgg_request(endpoint, **kwargs):
+    resp = requests.get(BGG_URL.format(endpoint), params=kwargs)
+    if resp.status_code != 200:
+        return None
+
+    return ET.fromstring(resp.content)
+
+
+def _save_data(filename, data):
+    pathlib.Path(os.path.join(DATA_DIR, filename)).write_bytes(data)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
