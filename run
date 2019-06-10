@@ -94,10 +94,11 @@ class Command:
 
         for user in users:
             collection = Command.parse_collection(user)
-            collections[users] = collection
+            collections[user] = collection
 
         analyzers_cls = [
-            _MasterList
+            _MasterList,
+            _MostWanted,
         ]
         analyzers = [cls() for cls in analyzers_cls]
 
@@ -172,23 +173,47 @@ class _MasterList:
     def result(self):
         return self.master_list
 
+MostWantedItem = namedtuple('MostWantedItem', [
+    'game_id',
+    'wanted_by',
+    'owned_by',
+])
 
 class _MostWanted:
     name = "most_wanted"
 
     def __init__(self):
-        self.master_list = {}
+        self.most_wanted = {}
 
     def process(self, username, collection):
         for game_id, game in collection.items():
-            self.master_list[game_id] = game._replace(
-                status=None,
-                numplays=None,
-            )
+            most_wanted_item = self.most_wanted.get(game_id, None)
+
+            if most_wanted_item is None:
+                most_wanted_item = MostWantedItem(
+                    game_id=game_id,
+                    wanted_by=[],
+                    owned_by=[],
+                )
+
+            if game.status.wanttoplay:
+                most_wanted_item.wanted_by.append(username)
+
+            if game.status.own:
+                most_wanted_item.owned_by.append(username)
+
+            self.most_wanted[game_id] = most_wanted_item
 
     @property
     def result(self):
-        return self.master_list
+        return sorted(
+            [
+                item
+                for item in self.most_wanted.values()
+                if len(item.wanted_by) > 0 and len(item.owned_by) > 0
+            ],
+            key=lambda x: -len(x.wanted_by)
+        )
 
 
 def _bgg_request(endpoint, **kwargs):
